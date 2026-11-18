@@ -208,25 +208,34 @@ class CorticalAdaptor(nn.Module):
         # autocast region it is dispatched in bf16 even when handed a float32 input. Its
         # backward then mixes a bf16 grad with the float32 saved input and dies with
         # "expected mat1 and mat2 to have the same dtype". Pin it to float32 explicitly.
+        # The cache stays float32 (see `forward`): casting pinv(W) back to bf16 is what breaks
+        # the round trip on ill-conditioned W.
         with torch.autocast(device_type=self.W.device.type, enabled=False):
-            return torch.linalg.pinv(self.W.float()).to(self.W.dtype)
+            return torch.linalg.pinv(self.W.float())
 
     @staticmethod
     def _on_load(module, incompatible_keys):
         module._pinv_stale = True
 
     def forward(self, X):
-        Z = X @ self.W
-        Z = self.z_hook(Z)  # hook for cortical states
-        if self.training:
-            W_pinv = self._pinv()
-        else:
-            if self._pinv_stale:
-                self._recompute_pinv()
-            W_pinv = self.W_pinv
-
-        X_hat = Z @ W_pinv
-        return X_hat, Z
+        # The round trip X -> Z -> X_hat runs in float32 whatever the model's dtype. In bf16 it
+        # does not give back X: the vision stream carries massive activations (~8,500 on a few
+        # dims) and W can be ill-conditioned (vision block 17 of the release: condition number
+        # 548, the others 2-9), so bf16 rounding of Z, W and pinv(W) leaves an error that the
+        # later blocks amplify (median per-token cosine with the true stream 0.93 by block 30).
+        # In float32 the adaptors are lossless, as `initialize` assumes.
+        with torch.autocast(device_type=X.device.type, enabled=False):
+            Z = X.float() @ self.W.float()
+            Z = self.z_hook(Z)  # hook for cortical states
+            if self.training:
+                W_pinv = self._pinv()
+            else:
+                # `model.bfloat16()` after loading casts the cache without marking it stale
+                if self._pinv_stale or self.W_pinv.dtype != torch.float32:
+                    self._recompute_pinv()
+                W_pinv = self.W_pinv
+            X_hat = Z @ W_pinv
+        return X_hat.to(X.dtype), Z.to(X.dtype)   # cortical states as before (spatial loss, hooks)
 
     def initialize(self, epsilon: float = 1e-3, identity=False):
         with torch.no_grad():
